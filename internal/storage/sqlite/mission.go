@@ -273,7 +273,7 @@ func (s *Store) CommitTripStart(ctx context.Context, commit repository.TripStart
 }
 
 func (s *Store) CommitTripCompletion(ctx context.Context, commit repository.TripCompletionCommit) error {
-	if err := s.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
 		tripResult, err := tx.ExecContext(ctx, `
 			UPDATE trips SET status = ?, completed_at = ?, distance_meters = ?, version = ?, updated_at = ?
 			WHERE id = ? AND status = 'running' AND version = ?`,
@@ -307,14 +307,11 @@ func (s *Store) CommitTripCompletion(ctx context.Context, commit repository.Trip
 		if err := rowsAffectedExactlyOne(vehicleResult, "vehicle release"); err != nil {
 			return err
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	if err := insertAudit(ctx, s.db, commit.Audit); err != nil {
-		return err
-	}
-	return insertOutbox(ctx, s.db, commit.Outbox)
+		if err := insertAudit(ctx, tx, commit.Audit); err != nil {
+			return err
+		}
+		return insertOutbox(ctx, tx, commit.Outbox)
+	})
 }
 
 func (s *Store) CancelPendingMission(ctx context.Context, id string, expectedVersion int64, at time.Time, event audit.Event) error {

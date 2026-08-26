@@ -319,6 +319,180 @@ func TestTelemetryIsIdempotentAndDoesNotRegressSnapshot(t *testing.T) {
 	}
 }
 
+// seedRunningTrip sets up a mission, vehicle, and trip whose state mirrors a
+// successful dispatch + start so CommitTripCompletion can be exercised.
+func seedRunningTrip(t *testing.T, store *Store) (mission.Mission, fleet.Vehicle, trip.Trip, audit.Event) {
+	t.Helper()
+	ctx := context.Background()
+	user, region, vehicle := seedCore(t, store)
+	missionValue := mission.Mission{ID: "m1", RegionID: region.ID, ExternalReference: "ext", IdempotencyKey: "key",
+		Kind: "passenger", Priority: mission.PriorityRoutine, Status: mission.StatusPending,
+		PickupLatitude: 31.2, PickupLongitude: 121.4, DropoffLatitude: 31.3, DropoffLongitude: 121.5,
+		EarliestStartAt: fixedNow, DeadlineAt: fixedNow.Add(time.Hour), MinimumBattery: 20,
+		RequiredCapability: "passenger", Version: 1, CreatedBy: user.ID, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	if err := store.CreateMission(ctx, missionValue); err != nil {
+		t.Fatalf("create mission: %v", err)
+	}
+	assigned, _ := missionValue.Assign(vehicle.ID)
+	assigned.UpdatedAt = fixedNow
+	reserved, _ := vehicle.Transition(fleet.VehicleReserved)
+	reserved.UpdatedAt = fixedNow
+	tripValue := trip.Trip{ID: "t1", MissionID: missionValue.ID, VehicleID: vehicle.ID, Status: trip.StatusScheduled,
+		ScheduledAt: fixedNow, Version: 1, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	dispatchAudit := audit.Event{ID: "a0", ActorID: user.ID, ActorRole: string(user.Role), Action: "mission.dispatch",
+		ObjectType: "mission", ObjectID: missionValue.ID, Result: audit.ResultSuccess, RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+	if err := store.CommitDispatch(ctx, repository.DispatchCommit{Mission: assigned, Vehicle: reserved, Trip: tripValue,
+		Audit: dispatchAudit, ExpectedMissionVersion: missionValue.Version, ExpectedVehicleVersion: vehicle.Version}); err != nil {
+		t.Fatalf("commit dispatch: %v", err)
+	}
+	started, _ := tripValue.Start(fixedNow)
+	startedMission, _ := assigned.Transition(mission.StatusInProgress)
+	startedVehicle, _ := reserved.Transition(fleet.VehicleInTrip)
+	started.UpdatedAt = fixedNow
+	startedMission.UpdatedAt = fixedNow
+	startedVehicle.UpdatedAt = fixedNow
+	startAudit := audit.Event{ID: "a1", ActorID: user.ID, ActorRole: string(user.Role), Action: "trip.start",
+		ObjectType: "trip", ObjectID: tripValue.ID, Result: audit.ResultSuccess, RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+	if err := store.CommitTripStart(ctx, repository.TripStartCommit{Trip: started, Mission: startedMission, Vehicle: startedVehicle,
+		Audit: startAudit, ExpectedTripVersion: tripValue.Version, ExpectedMissionVersion: assigned.Version,
+		ExpectedVehicleVersion: reserved.Version}); err != nil {
+		t.Fatalf("commit trip start: %v", err)
+	}
+	return startedMission, startedVehicle, started, startAudit
+}
+
+func TestTripCompletionCommitsAuditAndOutboxAtomically(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	startedMission, startedVehicle, startedTrip, _ := seedRunningTrip(t, store)
+
+	completedTrip, _ := startedTrip.Complete(fixedNow, 1500)
+	completedMission, _ := startedMission.Transition(mission.StatusCompleted)
+	releasedVehicle, _ := startedVehicle.Transition(fleet.VehicleAvailable)
+	completedTrip.UpdatedAt = fixedNow
+	completedMission.UpdatedAt = fixedNow
+	releasedVehicle.UpdatedAt = fixedNow
+	outbox := job.Outbox{ID: "e1", Topic: "trip.completed", AggregateType: "trip", AggregateID: completedTrip.ID,
+		Payload: []byte(`{}`), Status: job.StatusPending, MaxAttempts: 5, AvailableAt: fixedNow, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	auditEvent := audit.Event{ID: "a-complete", ActorID: startedMission.CreatedBy, ActorRole: string(auth.RoleDispatcher),
+		Action: "trip.complete", ObjectType: "trip", ObjectID: completedTrip.ID, Result: audit.ResultSuccess,
+		RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+	commit := repository.TripCompletionCommit{Trip: completedTrip, Mission: completedMission, Vehicle: releasedVehicle,
+		Audit: auditEvent, Outbox: outbox, ExpectedTripVersion: startedTrip.Version,
+		ExpectedMissionVersion: startedMission.Version, ExpectedVehicleVersion: startedVehicle.Version}
+	if err := store.CommitTripCompletion(ctx, commit); err != nil {
+		t.Fatalf("commit completion: %v", err)
+	}
+	loadedTrip, _ := store.TripByID(ctx, completedTrip.ID)
+	loadedMission, _ := store.MissionByID(ctx, completedMission.ID)
+	loadedVehicle, _ := store.VehicleByID(ctx, releasedVehicle.ID)
+	if loadedTrip.Status != trip.StatusCompleted || loadedMission.Status != mission.StatusCompleted ||
+		loadedVehicle.Status != fleet.VehicleAvailable {
+		t.Fatalf("completion did not persist: trip=%s mission=%s vehicle=%s",
+			loadedTrip.Status, loadedMission.Status, loadedVehicle.Status)
+	}
+	if _, err := store.AuditEventByID(ctx, auditEvent.ID); err != nil {
+		t.Fatalf("audit not persisted on success: %v", err)
+	}
+	if loaded, err := store.OutboxByID(ctx, outbox.ID); err != nil || loaded.Status != job.StatusPending {
+		t.Fatalf("outbox not persisted on success: %+v err=%v", loaded, err)
+	}
+}
+
+// A duplicate audit id collides on the audit_events primary key, modelling the
+// reported persistence-conflict failure on the completion event path.
+func TestTripCompletionRollsBackWhenAuditCollisionAborts(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	startedMission, startedVehicle, startedTrip, _ := seedRunningTrip(t, store)
+
+	// Pre-insert an audit row whose id the completion path will reuse, forcing a
+	// primary-key conflict inside the completion transaction.
+	collidingAudit := audit.Event{ID: "a-complete", ActorID: startedMission.CreatedBy, ActorRole: string(auth.RoleDispatcher),
+		Action: "earlier", ObjectType: "trip", ObjectID: startedTrip.ID, Result: audit.ResultSuccess,
+		RequestID: "req-earlier", Details: []byte(`{}`), CreatedAt: fixedNow}
+	if err := store.AppendAudit(ctx, collidingAudit); err != nil {
+		t.Fatalf("seed colliding audit: %v", err)
+	}
+
+	completedTrip, _ := startedTrip.Complete(fixedNow, 1500)
+	completedMission, _ := startedMission.Transition(mission.StatusCompleted)
+	releasedVehicle, _ := startedVehicle.Transition(fleet.VehicleAvailable)
+	completedTrip.UpdatedAt = fixedNow
+	completedMission.UpdatedAt = fixedNow
+	releasedVehicle.UpdatedAt = fixedNow
+	outbox := job.Outbox{ID: "e1", Topic: "trip.completed", AggregateType: "trip", AggregateID: completedTrip.ID,
+		Payload: []byte(`{}`), Status: job.StatusPending, MaxAttempts: 5, AvailableAt: fixedNow, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	auditEvent := audit.Event{ID: "a-complete", ActorID: startedMission.CreatedBy, ActorRole: string(auth.RoleDispatcher),
+		Action: "trip.complete", ObjectType: "trip", ObjectID: completedTrip.ID, Result: audit.ResultSuccess,
+		RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+	commit := repository.TripCompletionCommit{Trip: completedTrip, Mission: completedMission, Vehicle: releasedVehicle,
+		Audit: auditEvent, Outbox: outbox, ExpectedTripVersion: startedTrip.Version,
+		ExpectedMissionVersion: startedMission.Version, ExpectedVehicleVersion: startedVehicle.Version}
+	if err := store.CommitTripCompletion(ctx, commit); !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("completion with colliding audit should conflict: %v", err)
+	}
+
+	// State must remain pre-completion so the dispatcher can safely retry.
+	loadedTrip, _ := store.TripByID(ctx, startedTrip.ID)
+	loadedMission, _ := store.MissionByID(ctx, startedMission.ID)
+	loadedVehicle, _ := store.VehicleByID(ctx, startedVehicle.ID)
+	if loadedTrip.Status != trip.StatusRunning || loadedMission.Status != mission.StatusInProgress ||
+		loadedVehicle.Status != fleet.VehicleInTrip {
+		t.Fatalf("completion leaked partial state: trip=%s mission=%s vehicle=%s",
+			loadedTrip.Status, loadedMission.Status, loadedVehicle.Status)
+	}
+	if loadedTrip.Version != startedTrip.Version || loadedMission.Version != startedMission.Version ||
+		loadedVehicle.Version != startedVehicle.Version {
+		t.Fatalf("versions advanced on rolled-back completion: trip=%d mission=%d vehicle=%d",
+			loadedTrip.Version, loadedMission.Version, loadedVehicle.Version)
+	}
+	if loaded, err := store.OutboxByID(ctx, outbox.ID); !errors.Is(err, common.ErrNotFound) {
+		t.Fatalf("outbox persisted despite rollback: %+v err=%v", loaded, err)
+	}
+	// The colliding audit id must still point at the pre-existing seed row, not
+	// the rolled-back completion audit.
+	remaining, err := store.AuditEventByID(ctx, auditEvent.ID)
+	if err != nil {
+		t.Fatalf("seed audit missing after rollback: %v", err)
+	}
+	if remaining.Action != "earlier" {
+		t.Fatalf("completion audit overwrote seed despite rollback: action=%s", remaining.Action)
+	}
+
+	// A genuine retry with fresh ids must succeed in one shot.
+	completedTrip2, _ := startedTrip.Complete(fixedNow, 1500)
+	completedMission2, _ := startedMission.Transition(mission.StatusCompleted)
+	releasedVehicle2, _ := startedVehicle.Transition(fleet.VehicleAvailable)
+	completedTrip2.UpdatedAt = fixedNow
+	completedMission2.UpdatedAt = fixedNow
+	releasedVehicle2.UpdatedAt = fixedNow
+	outbox2 := outbox
+	outbox2.ID = "e2"
+	auditEvent2 := auditEvent
+	auditEvent2.ID = "a-complete-2"
+	retry := repository.TripCompletionCommit{Trip: completedTrip2, Mission: completedMission2, Vehicle: releasedVehicle2,
+		Audit: auditEvent2, Outbox: outbox2, ExpectedTripVersion: startedTrip.Version,
+		ExpectedMissionVersion: startedMission.Version, ExpectedVehicleVersion: startedVehicle.Version}
+	if err := store.CommitTripCompletion(ctx, retry); err != nil {
+		t.Fatalf("retry completion after rollback failed: %v", err)
+	}
+	loadedTrip2, _ := store.TripByID(ctx, startedTrip.ID)
+	loadedMission2, _ := store.MissionByID(ctx, startedMission.ID)
+	loadedVehicle2, _ := store.VehicleByID(ctx, startedVehicle.ID)
+	if loadedTrip2.Status != trip.StatusCompleted || loadedMission2.Status != mission.StatusCompleted ||
+		loadedVehicle2.Status != fleet.VehicleAvailable {
+		t.Fatalf("retry did not complete: trip=%s mission=%s vehicle=%s",
+			loadedTrip2.Status, loadedMission2.Status, loadedVehicle2.Status)
+	}
+	if _, err := store.AuditEventByID(ctx, auditEvent2.ID); err != nil {
+		t.Fatalf("retry audit not persisted: %v", err)
+	}
+	if loaded, err := store.OutboxByID(ctx, outbox2.ID); err != nil || loaded.Status != job.StatusPending {
+		t.Fatalf("retry outbox not persisted: %+v err=%v", loaded, err)
+	}
+}
+
 func TestOutboxLeaseRecoveryAndCompletion(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
