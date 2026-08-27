@@ -195,43 +195,6 @@ func (s *Store) CommitDispatch(ctx context.Context, commit repository.DispatchCo
 	})
 }
 
-func (s *Store) AssignMissionForDispatch(ctx context.Context, commit repository.DispatchCommit) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE missions SET status = ?, assigned_vehicle_id = ?, version = ?, updated_at = ?
-		WHERE id = ? AND status = 'pending' AND version = ?`,
-		commit.Mission.Status, commit.Mission.AssignedVehicleID, commit.Mission.Version,
-		formatTime(commit.Mission.UpdatedAt), commit.Mission.ID, commit.ExpectedMissionVersion)
-	if err != nil {
-		return mapSQLError(err, "mission dispatch")
-	}
-	return rowsAffectedExactlyOne(result, "mission dispatch")
-}
-
-func (s *Store) CommitDispatchResources(ctx context.Context, commit repository.DispatchCommit) error {
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		vehicleResult, err := tx.ExecContext(ctx, `
-			UPDATE vehicles SET status = 'reserved', version = ?, updated_at = ?
-			WHERE id = ? AND status = 'available' AND version = ?`,
-			commit.Vehicle.Version, formatTime(commit.Vehicle.UpdatedAt), commit.Vehicle.ID, commit.ExpectedVehicleVersion)
-		if err != nil {
-			return mapSQLError(err, "vehicle reservation")
-		}
-		if err := rowsAffectedExactlyOne(vehicleResult, "vehicle reservation"); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO trips(id, mission_id, vehicle_id, status, scheduled_at, started_at, completed_at,
-				abort_reason, distance_meters, version, created_at, updated_at)
-			VALUES(?, ?, ?, ?, ?, NULL, NULL, '', 0, ?, ?, ?)`,
-			commit.Trip.ID, commit.Trip.MissionID, commit.Trip.VehicleID, commit.Trip.Status,
-			formatTime(commit.Trip.ScheduledAt), commit.Trip.Version,
-			formatTime(commit.Trip.CreatedAt), formatTime(commit.Trip.UpdatedAt)); err != nil {
-			return mapSQLError(err, "trip")
-		}
-		return insertAudit(ctx, tx, commit.Audit)
-	})
-}
-
 func (s *Store) TripByID(ctx context.Context, id string) (trip.Trip, error) {
 	return scanTrip(s.db.QueryRowContext(ctx, tripSelect+" WHERE id = ?", id))
 }

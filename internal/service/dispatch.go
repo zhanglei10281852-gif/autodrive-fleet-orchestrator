@@ -27,8 +27,6 @@ type DispatchRepository interface {
 	VehicleByID(context.Context, string) (fleet.Vehicle, error)
 	AvailableVehicleCandidates(context.Context, string, string, int, time.Time, int) ([]fleet.Vehicle, error)
 	CommitDispatch(context.Context, repository.DispatchCommit) error
-	AssignMissionForDispatch(context.Context, repository.DispatchCommit) error
-	CommitDispatchResources(context.Context, repository.DispatchCommit) error
 	TripByID(context.Context, string) (trip.Trip, error)
 	TripByMissionID(context.Context, string) (trip.Trip, error)
 	CommitTripStart(context.Context, repository.TripStartCommit) error
@@ -180,10 +178,7 @@ func (s *DispatchService) Dispatch(ctx context.Context, principal auth.Principal
 		Mission: assigned, Vehicle: reserved, Trip: created, Audit: auditEvent,
 		ExpectedMissionVersion: target.Version, ExpectedVehicleVersion: vehicle.Version,
 	}
-	if err := s.repository.AssignMissionForDispatch(ctx, commit); err != nil {
-		return trip.Trip{}, err
-	}
-	if err := s.repository.CommitDispatchResources(ctx, commit); err != nil {
+	if err := s.repository.CommitDispatch(ctx, commit); err != nil {
 		return trip.Trip{}, err
 	}
 	return created, nil
