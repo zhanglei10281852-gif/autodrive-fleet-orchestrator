@@ -29,8 +29,6 @@ type ResourceRepository interface {
 	StartCharging(context.Context, charging.Session, charging.Connector, int64, time.Time, audit.Event) error
 	CompleteCharging(context.Context, charging.Session, int64, time.Time, audit.Event, job.Outbox) error
 	OpenMaintenance(context.Context, maintenance.WorkOrder, fleet.Vehicle, audit.Event) error
-	LockVehicleForMaintenance(context.Context, fleet.Vehicle, time.Time) error
-	CreateMaintenanceOrder(context.Context, maintenance.WorkOrder, audit.Event) error
 	MaintenanceByID(context.Context, string) (maintenance.WorkOrder, error)
 	UpdateMaintenance(context.Context, maintenance.WorkOrder, int64) error
 	CompleteMaintenance(context.Context, maintenance.WorkOrder, fleet.Vehicle, fleet.VehicleStatus, time.Time, audit.Event) error
@@ -242,10 +240,7 @@ func (s *ResourceService) OpenMaintenance(ctx context.Context, principal auth.Pr
 	if err != nil {
 		return maintenance.WorkOrder{}, err
 	}
-	if err := s.repository.LockVehicleForMaintenance(ctx, vehicle, now); err != nil {
-		return maintenance.WorkOrder{}, err
-	}
-	if err := s.repository.CreateMaintenanceOrder(ctx, order, event); err != nil {
+	if err := s.repository.OpenMaintenance(ctx, order, vehicle, event); err != nil {
 		return maintenance.WorkOrder{}, err
 	}
 	return order, nil

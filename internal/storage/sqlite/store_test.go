@@ -15,6 +15,7 @@ import (
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/common"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/fleet"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/job"
+	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/maintenance"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/mission"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/telemetry"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/trip"
@@ -407,5 +408,55 @@ func TestVehicleListUsesSameFilterForCountAndRows(t *testing.T) {
 	}
 	if second.Total != page.Total || len(second.Items) != 1 {
 		t.Fatalf("unexpected second page total=%d items=%d", second.Total, len(second.Items))
+	}
+}
+
+func TestOpenMaintenanceCommitsVehicleOrderAndAuditAtomically(t *testing.T) {
+	store := openTestStore(t)
+	user, _, vehicle := seedCore(t, store)
+	ctx := context.Background()
+	order := maintenance.WorkOrder{ID: "w1", VehicleID: vehicle.ID, Status: maintenance.StatusOpen,
+		Reason: "scheduled brake inspection", Priority: "normal", PreviousVehicleStatus: string(vehicle.Status),
+		RequiredChecks: []string{"brake", "steering"}, CompletedChecks: []string{},
+		Version: 1, CreatedBy: user.ID, CreatedAt: fixedNow}
+	event := audit.Event{ID: "a-mnt-1", ActorID: user.ID, ActorRole: string(user.Role), Action: "maintenance.open",
+		ObjectType: "maintenance_order", ObjectID: order.ID, Result: audit.ResultSuccess, RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+
+	if err := store.OpenMaintenance(ctx, order, vehicle, event); err != nil {
+		t.Fatalf("open maintenance: %v", err)
+	}
+
+	loadedVehicle, _ := store.VehicleByID(ctx, vehicle.ID)
+	loadedOrder, _ := store.MaintenanceByID(ctx, order.ID)
+	if loadedVehicle.Status != fleet.VehicleMaintenance || loadedVehicle.Version != vehicle.Version+1 {
+		t.Fatalf("vehicle not locked for maintenance: %+v", loadedVehicle)
+	}
+	if loadedOrder.Status != maintenance.StatusOpen || loadedOrder.PreviousVehicleStatus != string(vehicle.Status) {
+		t.Fatalf("order not persisted: %+v", loadedOrder)
+	}
+	auditCount, err := store.AuditCountForRequest(ctx, "req")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("maintenance.open audit not persisted: %d", auditCount)
+	}
+
+	// A second open attempt against the now-stale vehicle version must fail atomically:
+	// the vehicle already being 'maintenance' means the optimistic lock fails, so no
+	// additional order or audit row should be written even when the caller reused stale state.
+	staleOrder := order
+	staleOrder.ID = "w2"
+	staleEvent := event
+	staleEvent.ID = "a-mnt-2"
+	if err := store.OpenMaintenance(ctx, staleOrder, vehicle, staleEvent); !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("second open maintenance should conflict: %v", err)
+	}
+	var orderCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM maintenance_orders`).Scan(&orderCount); err != nil {
+		t.Fatal(err)
+	}
+	if orderCount != 1 {
+		t.Fatalf("failed maintenance open leaked order: %d", orderCount)
 	}
 }

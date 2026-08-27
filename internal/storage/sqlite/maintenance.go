@@ -45,42 +45,6 @@ func (s *Store) OpenMaintenance(ctx context.Context, order maintenance.WorkOrder
 	})
 }
 
-func (s *Store) LockVehicleForMaintenance(ctx context.Context, vehicle fleet.Vehicle, at time.Time) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE vehicles SET status = 'maintenance', version = version + 1, updated_at = ?
-		WHERE id = ? AND status IN ('offline', 'available') AND version = ?`,
-		formatTime(at), vehicle.ID, vehicle.Version)
-	if err != nil {
-		return mapSQLError(err, "maintenance vehicle")
-	}
-	return rowsAffectedExactlyOne(result, "maintenance vehicle")
-}
-
-func (s *Store) CreateMaintenanceOrder(ctx context.Context, order maintenance.WorkOrder, event audit.Event) error {
-	required, err := encodeStrings(order.RequiredChecks)
-	if err != nil {
-		return err
-	}
-	completed, err := encodeStrings(order.CompletedChecks)
-	if err != nil {
-		return err
-	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO maintenance_orders(id, vehicle_id, status, reason, priority,
-				previous_vehicle_status, assigned_technician, required_checks, completed_checks,
-				resolution, version, created_by, created_at, started_at, completed_at)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			order.ID, order.VehicleID, order.Status, order.Reason, order.Priority,
-			order.PreviousVehicleStatus, order.AssignedTechnician, required, completed,
-			order.Resolution, order.Version, order.CreatedBy, formatTime(order.CreatedAt),
-			nullableTime(order.StartedAt), nullableTime(order.CompletedAt)); err != nil {
-			return mapSQLError(err, "maintenance order")
-		}
-		return insertAudit(ctx, tx, event)
-	})
-}
-
 const maintenanceSelect = `SELECT id, vehicle_id, status, reason, priority, previous_vehicle_status,
 	assigned_technician, required_checks, completed_checks, resolution, version, created_by,
 	created_at, started_at, completed_at FROM maintenance_orders`
