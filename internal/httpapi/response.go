@@ -12,8 +12,6 @@ import (
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/request"
 )
 
-var responseBuffer bytes.Buffer
-
 type ErrorResponse struct {
 	Error APIError `json:"error"`
 }
@@ -25,13 +23,16 @@ type APIError struct {
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
-	responseBuffer.Reset()
-	if err := json.NewEncoder(&responseBuffer).Encode(value); err != nil {
+	// A per-call buffer is mandatory: HTTP handlers run concurrently, so a
+	// shared buffer would let one request's Reset/Encode overwrite another
+	// request's bytes mid-write, producing crossed or unparseable bodies.
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(value); err != nil {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = w.Write(responseBuffer.Bytes())
+	_, _ = w.Write(buf.Bytes())
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
