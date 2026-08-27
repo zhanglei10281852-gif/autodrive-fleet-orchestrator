@@ -284,6 +284,51 @@ func TestDispatchCommitIsAtomicAndRejectsSecondOwner(t *testing.T) {
 	}
 }
 
+func TestCreateMissionIdempotencyKeyConvergesUnderConcurrentRetry(t *testing.T) {
+	store := openTestStore(t)
+	user, region, _ := seedCore(t, store)
+	ctx := context.Background()
+
+	first := mission.Mission{ID: "m-concurrent-1", RegionID: region.ID, ExternalReference: "ext", IdempotencyKey: "same-key",
+		Kind: "passenger", Priority: mission.PriorityRoutine, Status: mission.StatusPending,
+		PickupLatitude: 31.2, PickupLongitude: 121.4, DropoffLatitude: 31.3, DropoffLongitude: 121.5,
+		EarliestStartAt: fixedNow, DeadlineAt: fixedNow.Add(time.Hour), MinimumBattery: 20,
+		RequiredCapability: "passenger", Version: 1, CreatedBy: user.ID, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	if err := store.CreateMission(ctx, first); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// A concurrent retry reusing the same idempotency key with identical
+	// content must fail the UNIQUE constraint, and that conflict must unwrap to
+	// ErrConflict so DispatchService.CreateMission can reconcile it.
+	second := first
+	second.ID = "m-concurrent-2"
+	err := store.CreateMission(ctx, second)
+	if err == nil {
+		t.Fatal("duplicate idempotency key unexpectedly succeeded")
+	}
+	if !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("concurrent retry must surface a conflict that reconciles, got %v", err)
+	}
+
+	loaded, err := store.MissionByIdempotency(ctx, user.ID, "same-key")
+	if err != nil {
+		t.Fatalf("re-read by idempotency key: %v", err)
+	}
+	if loaded.ID != "m-concurrent-1" {
+		t.Fatalf("expected the committed mission to win, got %s", loaded.ID)
+	}
+
+	// Reusing the key with divergent content stays rejected — reconciliation
+	// must surface the persisted winner, not the losing request.
+	divergent := first
+	divergent.ID = "m-concurrent-3"
+	divergent.Kind = "cargo"
+	if err := store.CreateMission(ctx, divergent); !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("divergent content reusing the key must still conflict: %v", err)
+	}
+}
+
 func TestTelemetryIsIdempotentAndDoesNotRegressSnapshot(t *testing.T) {
 	store := openTestStore(t)
 	_, _, vehicle := seedCore(t, store)

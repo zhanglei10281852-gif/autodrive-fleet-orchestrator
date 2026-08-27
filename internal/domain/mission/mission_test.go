@@ -138,3 +138,21 @@ func statusIncluded(values []Status, target Status) bool {
 	}
 	return false
 }
+
+func TestWriteErrorUnwrapsCauseForConflictReconciliation(t *testing.T) {
+	// CreateMission wraps a UNIQUE-constraint failure as
+	// WriteError{Cause: ConflictError{...}}. DispatchService.CreateMission relies
+	// on errors.Is(err, common.ErrConflict) to trigger the concurrent-retry
+	// reconciliation. Without Unwrap, the wrapped ConflictError is invisible
+	// and a losing retry would surface the raw persistence conflict instead of
+	// converging on the committed mission.
+	conflict := common.ConflictError{Resource: "mission", Reason: "UNIQUE constraint failed"}
+	wrapped := WriteError{Operation: "create", Cause: conflict}
+	if !errors.Is(wrapped, common.ErrConflict) {
+		t.Fatalf("WriteError must unwrap to ErrConflict for reconciliation, got %v", wrapped)
+	}
+	var target common.ConflictError
+	if !errors.As(wrapped, &target) {
+		t.Fatalf("WriteError must expose the wrapped ConflictError via errors.As, got %v", wrapped)
+	}
+}

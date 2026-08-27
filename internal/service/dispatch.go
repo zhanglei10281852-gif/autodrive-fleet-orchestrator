@@ -96,10 +96,19 @@ func (s *DispatchService) CreateMission(ctx context.Context, principal auth.Prin
 		return mission.Mission{}, err
 	}
 	if err := s.repository.CreateMission(ctx, value); err != nil {
+		// Concurrent retries race the same idempotency key. Only the first
+		// INSERT wins the UNIQUE(created_by, idempotency_key) constraint; the
+		// rest fail with a conflict. To converge, every loser must re-read the
+		// committed mission: identical content returns the same task, while
+		// divergent content reusing the key stays rejected. The guard checks
+		// errors.Is(ErrConflict) instead of the concrete WriteError so any
+		// wrapper that unwraps to ErrConflict still reconciles.
 		if errors.Is(err, common.ErrConflict) {
-			existing, getErr := s.repository.MissionByIdempotency(ctx, principal.UserID, input.IdempotencyKey)
-			if getErr == nil && missionInputMatches(existing, input) {
-				return existing, nil
+			if existing, getErr := s.repository.MissionByIdempotency(ctx, principal.UserID, input.IdempotencyKey); getErr == nil {
+				if missionInputMatches(existing, input) {
+					return existing, nil
+				}
+				return mission.Mission{}, common.ConflictError{Resource: "idempotency_key", Reason: "key is bound to a different mission request"}
 			}
 		}
 		return mission.Mission{}, err
