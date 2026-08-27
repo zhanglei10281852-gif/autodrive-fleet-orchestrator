@@ -71,18 +71,6 @@ func scanUser(row *sql.Row) (auth.User, error) {
 	return user, nil
 }
 
-func (s *Store) CreateSession(ctx context.Context, session auth.Session) error {
-	if session.ID == "" || session.UserID == "" || session.TokenHash == "" {
-		return common.ErrInvalid
-	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO sessions(id, user_id, token_hash, expires_at, revoked_at, created_at, last_seen_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.TokenHash, formatTime(session.ExpiresAt),
-		nullableTime(session.RevokedAt), formatTime(session.CreatedAt), formatTime(session.LastSeen))
-	return mapSQLError(err, "session")
-}
-
 func (s *Store) CreateSessionWithAudit(ctx context.Context, session auth.Session, auditID, requestID string) error {
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
@@ -100,14 +88,6 @@ func (s *Store) CreateSessionWithAudit(ctx context.Context, session auth.Session
 		}
 		return nil
 	})
-}
-
-func (s *Store) RecordLoginAudit(ctx context.Context, session auth.Session, auditID, requestID string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO audit_events(id, actor_id, actor_role, action, object_type, object_id, result, request_id, details, created_at)
-		SELECT ?, id, role, 'auth.login', 'session', ?, 'success', ?, '{}', ? FROM users WHERE id = ?`,
-		auditID, session.ID, requestID, formatTime(session.CreatedAt), session.UserID)
-	return mapSQLError(err, "login audit")
 }
 
 func (s *Store) SessionByTokenHash(ctx context.Context, tokenHash string) (auth.Session, auth.User, error) {

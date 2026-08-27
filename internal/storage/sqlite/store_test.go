@@ -164,6 +164,26 @@ func TestSessionLifecyclePersistsAndRevokes(t *testing.T) {
 	}
 }
 
+func TestCreateSessionWithAuditIsAtomic(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	user, _, _ := seedCore(t, store)
+	first := auth.Session{ID: "s1", UserID: user.ID, TokenHash: "hash-1", ExpiresAt: fixedNow.Add(time.Hour), CreatedAt: fixedNow, LastSeen: fixedNow}
+	if err := store.CreateSessionWithAudit(ctx, first, "aud-dup", "req-1"); err != nil {
+		t.Fatalf("first create session with audit: %v", err)
+	}
+	orphan := auth.Session{ID: "s2", UserID: user.ID, TokenHash: "hash-2", ExpiresAt: fixedNow.Add(time.Hour), CreatedAt: fixedNow, LastSeen: fixedNow}
+	if err := store.CreateSessionWithAudit(ctx, orphan, "aud-dup", "req-2"); !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("duplicate audit id should conflict: %v", err)
+	}
+	if _, _, err := store.SessionByTokenHash(ctx, orphan.TokenHash); !errors.Is(err, common.ErrNotFound) {
+		t.Fatalf("failed audit leaked session: %v", err)
+	}
+	if count, err := store.AuditCountForRequest(ctx, "req-2"); err != nil || count != 0 {
+		t.Fatalf("orphan request audit count=%d err=%v", count, err)
+	}
+}
+
 func TestRestartRecoversPersistedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restart.db")
 	ctx := context.Background()

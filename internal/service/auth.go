@@ -24,8 +24,7 @@ type AuthRepository interface {
 	UpsertBootstrapUser(context.Context, auth.User) error
 	UserByUsername(context.Context, string) (auth.User, error)
 	UserByID(context.Context, string) (auth.User, error)
-	CreateSession(context.Context, auth.Session) error
-	RecordLoginAudit(context.Context, auth.Session, string, string) error
+	CreateSessionWithAudit(context.Context, auth.Session, string, string) error
 	SessionByTokenHash(context.Context, string) (auth.Session, auth.User, error)
 	RevokeSession(context.Context, string, string, string, string, time.Time) error
 	TouchSession(context.Context, string, time.Time) error
@@ -134,10 +133,7 @@ func (s *AuthService) Login(ctx context.Context, username, password, requestID s
 		ID: sessionID, UserID: user.ID, TokenHash: tokenHash(token), ExpiresAt: now.Add(s.ttl),
 		CreatedAt: now, LastSeen: now,
 	}
-	if err := s.repository.CreateSession(ctx, session); err != nil {
-		return LoginResult{}, err
-	}
-	if err := s.repository.RecordLoginAudit(ctx, session, auditID, requestID); err != nil {
+	if err := s.repository.CreateSessionWithAudit(ctx, session, auditID, requestID); err != nil {
 		return LoginResult{}, err
 	}
 	return LoginResult{
