@@ -156,17 +156,8 @@ func (s *FleetService) TransitionVehicle(ctx context.Context, principal auth.Pri
 		return fleet.Vehicle{}, err
 	}
 	updated.UpdatedAt = s.clock.Now()
-	updateResult := make(chan error, 1)
-	go func() {
-		updateResult <- s.repository.UpdateVehicle(ctx, updated, expectedVersion)
-	}()
-	select {
-	case updateErr := <-updateResult:
-		if updateErr != nil {
-			return fleet.Vehicle{}, updateErr
-		}
-	case <-time.After(10 * time.Millisecond):
-		return updated, nil
+	if err := s.repository.UpdateVehicle(ctx, updated, expectedVersion); err != nil {
+		return fleet.Vehicle{}, err
 	}
 	return updated, nil
 }
