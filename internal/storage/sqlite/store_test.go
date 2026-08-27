@@ -284,6 +284,59 @@ func TestDispatchCommitIsAtomicAndRejectsSecondOwner(t *testing.T) {
 	}
 }
 
+func TestMissionCancellationIsAtomicAndLeavesNoOrphanState(t *testing.T) {
+	store := openTestStore(t)
+	user, region, _ := seedCore(t, store)
+	ctx := context.Background()
+	missionValue := mission.Mission{ID: "m1", RegionID: region.ID, ExternalReference: "ext", IdempotencyKey: "key",
+		Kind: "passenger", Priority: mission.PriorityRoutine, Status: mission.StatusPending,
+		PickupLatitude: 31.2, PickupLongitude: 121.4, DropoffLatitude: 31.3, DropoffLongitude: 121.5,
+		EarliestStartAt: fixedNow, DeadlineAt: fixedNow.Add(time.Hour), MinimumBattery: 20,
+		RequiredCapability: "passenger", Version: 1, CreatedBy: user.ID, CreatedAt: fixedNow, UpdatedAt: fixedNow}
+	if err := store.CreateMission(ctx, missionValue); err != nil {
+		t.Fatal(err)
+	}
+	event := audit.Event{ID: "a1", ActorID: user.ID, ActorRole: string(user.Role), Action: "mission.cancel",
+		ObjectType: "mission", ObjectID: missionValue.ID, Result: audit.ResultSuccess, RequestID: "req", Details: []byte(`{}`), CreatedAt: fixedNow}
+	if err := store.CommitMissionCancellation(ctx, repository.MissionCancellationCommit{
+		Audit: event, ExpectedMissionVersion: missionValue.Version, CancelledAt: fixedNow,
+	}); err != nil {
+		t.Fatalf("commit cancellation: %v", err)
+	}
+	loaded, _ := store.MissionByID(ctx, missionValue.ID)
+	if loaded.Status != mission.StatusCancelled || loaded.Version != missionValue.Version+1 {
+		t.Fatalf("mission not cancelled: %+v", loaded)
+	}
+	counted, _ := store.AuditCountForRequest(ctx, event.RequestID)
+	if counted != 1 {
+		t.Fatalf("cancellation audit missing: %d", counted)
+	}
+
+	// A second attempt reusing the same audit id must fail atomically: the audit
+	// insert conflict rolls back the status update, so the mission keeps the
+	// cancelled state committed by the first attempt (no orphaned transition).
+	stale := event
+	stale.ID = "a1-reuse"
+	second := missionValue
+	second.ID = "m2"
+	second.IdempotencyKey = "key2"
+	if err := store.CreateMission(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	conflictEvent := event
+	conflictEvent.ObjectID = second.ID
+	conflictEvent.ID = "a1" // collides with the first audit row
+	if err := store.CommitMissionCancellation(ctx, repository.MissionCancellationCommit{
+		Audit: conflictEvent, ExpectedMissionVersion: second.Version, CancelledAt: fixedNow,
+	}); !errors.Is(err, common.ErrConflict) {
+		t.Fatalf("audit conflict should surface as conflict: %v", err)
+	}
+	leaked, _ := store.MissionByID(ctx, second.ID)
+	if leaked.Status != mission.StatusPending {
+		t.Fatalf("audit failure committed mission state: %+v", leaked)
+	}
+}
+
 func TestTelemetryIsIdempotentAndDoesNotRegressSnapshot(t *testing.T) {
 	store := openTestStore(t)
 	_, _, vehicle := seedCore(t, store)

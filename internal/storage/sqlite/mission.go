@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/audit"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/common"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/mission"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/trip"
@@ -314,18 +312,20 @@ func (s *Store) CommitTripCompletion(ctx context.Context, commit repository.Trip
 	})
 }
 
-func (s *Store) CancelPendingMissionState(ctx context.Context, id string, expectedVersion int64, at time.Time) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE missions SET status = 'cancelled', version = version + 1, updated_at = ?
-		WHERE id = ? AND status = 'pending' AND version = ?`, formatTime(at), id, expectedVersion)
-	if err != nil {
-		return mapSQLError(err, "mission cancellation")
-	}
-	return rowsAffectedExactlyOne(result, "mission cancellation")
-}
-
-func (s *Store) RecordMissionCancellation(ctx context.Context, event audit.Event) error {
-	return insertAudit(ctx, s.db, event)
+func (s *Store) CommitMissionCancellation(ctx context.Context, commit repository.MissionCancellationCommit) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE missions SET status = 'cancelled', version = version + 1, updated_at = ?
+			WHERE id = ? AND status = 'pending' AND version = ?`,
+			formatTime(commit.CancelledAt), commit.Audit.ObjectID, commit.ExpectedMissionVersion)
+		if err != nil {
+			return mapSQLError(err, "mission cancellation")
+		}
+		if err := rowsAffectedExactlyOne(result, "mission cancellation"); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, commit.Audit)
+	})
 }
 
 func nullableString(value string) any {

@@ -31,8 +31,7 @@ type DispatchRepository interface {
 	TripByMissionID(context.Context, string) (trip.Trip, error)
 	CommitTripStart(context.Context, repository.TripStartCommit) error
 	CommitTripCompletion(context.Context, repository.TripCompletionCommit) error
-	CancelPendingMissionState(context.Context, string, int64, time.Time) error
-	RecordMissionCancellation(context.Context, audit.Event) error
+	CommitMissionCancellation(context.Context, repository.MissionCancellationCommit) error
 }
 
 type DispatchService struct {
@@ -313,10 +312,11 @@ func (s *DispatchService) CancelMission(ctx context.Context, principal auth.Prin
 	if err != nil {
 		return err
 	}
-	if err := s.repository.CancelPendingMissionState(ctx, missionID, expectedVersion, s.clock.Now()); err != nil {
-		return err
-	}
-	return s.repository.RecordMissionCancellation(ctx, event)
+	return s.repository.CommitMissionCancellation(ctx, repository.MissionCancellationCommit{
+		Audit:                  event,
+		ExpectedMissionVersion: expectedVersion,
+		CancelledAt:            s.clock.Now(),
+	})
 }
 
 func (s *DispatchService) ListMissions(ctx context.Context, principal auth.Principal, filter mission.Filter) (common.Page[mission.Mission], error) {

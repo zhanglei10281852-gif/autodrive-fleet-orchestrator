@@ -1,6 +1,8 @@
 package repository
 
 import (
+	"time"
+
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/audit"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/fleet"
 	"github.com/zhanglei10281852-gif/autodrive-fleet-orchestrator/internal/domain/job"
@@ -38,6 +40,12 @@ type TripCompletionCommit struct {
 	ExpectedTripVersion    int64
 	ExpectedMissionVersion int64
 	ExpectedVehicleVersion int64
+}
+
+type MissionCancellationCommit struct {
+	Audit                   audit.Event
+	ExpectedMissionVersion  int64
+	CancelledAt             time.Time
 }
 
 type TelemetryCommit struct {
